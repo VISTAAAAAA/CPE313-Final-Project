@@ -8,3 +8,4 @@ torchvision
 cmake
 ninja
 pillow
+scikit-image
