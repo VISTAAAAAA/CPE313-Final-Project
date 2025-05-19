@@ -1,0 +1,8 @@
+streamlit
+opencv-python
+numpy
+torch
+ultralytics
+supervision
+sort-tracker
+torchvision
