@@ -1,154 +1,210 @@
-# vehicle_speed_app.py  ── version without the device= bug
-import streamlit as st
-import cv2, numpy as np, torch, tempfile, os, mimetypes, supervision as sv
-from pathlib import Path
-from datetime import datetime
-from ultralytics import YOLO
-from sort.sort import Sort
-from torchvision.ops import box_iou
+from __future__ import annotations
 
-# ───────────────────────────── UI options ────────────────────────────
-st.set_page_config(page_title="Vehicle Detection & Speed Estimation",
-                   layout="wide")
+import os
+import tempfile
+from datetime import datetime
+from pathlib import Path
+from typing import Dict, List, Tuple
+
+import cv2
+import mimetypes
+import numpy as np
+import streamlit as st
+import supervision as sv
+import torch
+from sort.sort import Sort  # Ensure "sort" is installed in requirements.txt
+from torchvision.ops import box_iou
+from ultralytics import YOLO
+
+# ────────────────────────────── UI CONFIG ──────────────────────────────
+st.set_page_config("🚗 Vehicle Detection & Speed Estimation", layout="wide")
+
 st.title("🚗 Vehicle Detection & Speed Estimation")
 
-TARGET_SIZE  = st.sidebar.slider("YOLO input size (px)", 320, 1280, 640, 160)
-TARGET_FPS   = st.sidebar.slider("Target FPS in output video", 5, 30, 15, 1)
-SPEED_LIMIT  = st.sidebar.slider("Overspeed threshold (km/h)", 10, 120, 20, 5)
+with st.sidebar:
+    st.header("⚙️ Settings")
+    TARGET_SIZE: int = st.slider("YOLO input size (px)", 320, 1280, 640, 160)
+    TARGET_FPS: int = st.slider("Target FPS in output video", 5, 30, 15, 1)
+    SPEED_LIMIT: int = st.slider("Overspeed threshold (km/h)", 10, 120, 20, 5)
+    CONF_THRES: float = st.slider("Confidence threshold", 0.05, 0.9, 0.25, 0.05)
+    IOU_THRES: float = st.slider("Polygon IoU threshold", 0.0, 1.0, 0.3, 0.05)
+    st.markdown("---")
+    st.caption("Upload an MP4 clip. 📹 Processing happens completely in‑browser on “Streamlit Cloud”.")
 
-uploaded_video = st.file_uploader("Upload an MP4 video",
-                                  type=["mp4"],
-                                  accept_multiple_files=False)
+uploaded_video = st.file_uploader("Video file", type=["mp4"], accept_multiple_files=False)
 
-# ───────────────────── helper: delete old temp files ──────────────────
-def cleanup_files():
-    for f in list(st.session_state.get("tmpfiles", set())):
-        Path(f).unlink(missing_ok=True)
-        st.session_state["tmpfiles"].discard(f)
+# ────────────────────────────── HELPERS ────────────────────────────────
+TEMP_DIR = Path(tempfile.gettempdir()) / f"vehicledemo_{st.session_state.get('run_id', os.urandom(4).hex())}"
+TEMP_DIR.mkdir(exist_ok=True, parents=True)
 
-# ───────────────────────────── main flow ──────────────────────────────
+@st.cache_resource(show_spinner=False)
+def load_model() -> Tuple[YOLO, torch.device]:
+    """Load YOLO model once per session and move to the best device."""
+    device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+    model = YOLO("best.pt").to(device)
+    # keep only vehicle‑like classes to speed up inference (7: truck, 8: bus)
+    model.overrides["classes"] = [7, 8]
+    return model, device
+
+model, device = load_model()
+CLASS_NAMES = model.model.names  # type: ignore[attr-defined]
+KEEP_IDS = set(model.overrides.get("classes", []))
+
+
+def cleanup_temp() -> None:
+    """Delete all temp files created in this session."""
+    for f in TEMP_DIR.glob("*"):
+        try:
+            f.unlink()
+        except Exception:
+            pass
+
+
+def seconds_to_kmh(seconds: float, dist_m: float = 100.0) -> float:
+    """Convert travel time for *dist_m* meters to km/h."""
+    return (dist_m / seconds) * 3.6 if seconds > 0 else 0.0
+
+
+def best_match(tbox: List[int], dboxes: List[List[int]]) -> Tuple[int, float] | None:
+    if not dboxes:
+        return None
+    ious = box_iou(torch.tensor([tbox]), torch.tensor(dboxes))[0]
+    max_val, idx = torch.max(ious, 0)
+    return (int(idx), float(max_val)) if max_val > 0 else None
+
+
+# ────────────────────────────── MAIN FLOW ──────────────────────────────
 if uploaded_video:
     mime, _ = mimetypes.guess_type(uploaded_video.name)
     if mime != "video/mp4":
-        st.error("Not a valid MP4 file."); st.stop()
+        st.error("Please upload a valid MP4 file.")
+        st.stop()
 
-    cleanup_files()                           # start fresh each run
+    # Save uploaded file to temp dir
+    in_path = TEMP_DIR / Path(uploaded_video.name).name
+    with in_path.open("wb") as f:
+        f.write(uploaded_video.read())
 
-    with tempfile.NamedTemporaryFile(delete=False, suffix=".mp4") as tmp_in:
-        tmp_in.write(uploaded_video.read())
-        in_path = tmp_in.name
-    fd, out_path = tempfile.mkstemp(suffix=".mp4"); os.close(fd)
-    st.session_state.setdefault("tmpfiles", set()).update({in_path, out_path})
+    # Prepare output path
+    out_path = TEMP_DIR / f"processed_{in_path.stem}.mp4"
 
-    # ───────────────────────── model / tracker ────────────────────────
-    model   = YOLO("best.pt")                 # FIX ① no device arg here
-    tracker = Sort(max_age=60, min_hits=3, iou_threshold=0.3)
+    # Tracker
+    tracker = Sort(max_age=60, min_hits=3, iou_threshold=IOU_THRES)
 
-    KEEP_IDS     = {7, 8};  CONF_THRES = 0.05
-    CLASS_NAMES  = model.model.names
-    FACTOR_KM    = 3.6;  DIST_METERS  = 100
-    POINT_A_Y, POINT_B_Y, LINE_TOL = 1000, 1400, 10
+    # ROI & speed lines (relative ratios, independent of resolution)
+    ROI_POLY_REL = np.array([[0.42, 0.30], [0.55, 0.30], [0.65, 0.73], [0.27, 0.73]])
+    LINE_A_REL, LINE_B_REL = 0.55, 0.82  # y positions as fraction of H
 
-    poly_zone = sv.PolygonZone(
-        polygon=np.array([[1600, 800], [2100, 800], [2500, 1900], [1000, 1900]])
-    )
+    cap = cv2.VideoCapture(str(in_path))
+    ret, frame = cap.read()
+    if not ret:
+        st.error("Cannot read the video file.")
+        st.stop()
 
-    cap = cv2.VideoCapture(in_path)
-    ok, frame = cap.read()
-    if not ok: st.error("Cannot read video."); st.stop()
-
-    fps_in  = cap.get(cv2.CAP_PROP_FPS) or 30
-    skip_N  = max(1, int(round(fps_in / TARGET_FPS)))
-    out_fps = fps_in / skip_N
     H, W = frame.shape[:2]
-    writer = cv2.VideoWriter(out_path, cv2.VideoWriter_fourcc(*"mp4v"),
-                             out_fps, (W, H))
+    ROI_POLY = np.round(ROI_POLY_REL * np.array([[W, H]])).astype(int).reshape(-1, 2)
+    poly_zone = sv.PolygonZone(polygon=ROI_POLY)
 
-    entry_times, speeds, id_map = {}, {}, {}
-    rx1, ry1, rx2, ry2 = cv2.boundingRect(poly_zone.polygon)
-    side = max(rx2 - rx1, ry2 - ry1)
-    cx, cy = rx1 + (rx2 - rx1)//2, ry1 + (ry2 - ry1)//2
-    ROI = (max(0, cx - side//2), max(0, cy - side//2),
-           min(W-1, cx + side//2), min(H-1, cy + side//2))
+    fps_in: float = cap.get(cv2.CAP_PROP_FPS) or 30.0
+    skip_N = max(1, int(round(fps_in / TARGET_FPS)))
+    out_fps = fps_in / skip_N
 
-    def scale_bbox(b,s,dx,dy):
-        x1,y1,x2,y2=b; return [int(x1/s+dx),int(y1/s+dy),int(x2/s+dx),int(y2/s+dy)]
-    def best_match(tbox, dboxes):
-        if len(dboxes)==0: return None
-        ious = box_iou(torch.tensor([tbox]), torch.tensor(dboxes))[0]
-        m,i = torch.max(ious,0); return (int(i),float(m)) if m>0 else None
+    writer = cv2.VideoWriter(str(out_path), cv2.VideoWriter_fourcc(*"mp4v"), out_fps, (W, H))
+
+    entry_times: Dict[int, float] = {}
+    speeds: Dict[int, float] = {}
+    id_map: Dict[int, int] = {}
 
     total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 1)
-    processed = idx = 0
-    prog = st.progress(0.0,"Processing…")
+    processed = 0
+    prog = st.progress(0.0, text="Processing… 0.0% | ETA –")
 
-    while ok:
+    def update_progress(curr_idx: int) -> None:
+        pct = curr_idx / total_frames
+        eta_frames = total_frames - curr_idx
+        eta_sec = eta_frames / fps_in if fps_in else 0
+        prog.progress(pct, text=f"Processing… {pct*100:4.1f}% | ETA {eta_sec:4.0f}s")
+
+    idx = 0
+    while ret:
         if idx % skip_N == 0:
-            crop = frame[ROI[1]:ROI[3], ROI[0]:ROI[2]]
-            scale = TARGET_SIZE / crop.shape[0]
-            resized = cv2.resize(crop,None,fx=scale,fy=scale)
+            ts_video = idx / fps_in  # timestamp in the video itself
 
-            # FIX ② pass device each call
-            results = model(resized, verbose=False,
-                            device=0 if torch.cuda.is_available() else "cpu")[0]
+            # crop to ROI square to reduce inference cost
+            rx1, ry1, rx2, ry2 = cv2.boundingRect(ROI_POLY)
+            side = max(rx2 - rx1, ry2 - ry1)
+            cx, cy = rx1 + (rx2 - rx1) // 2, ry1 + (ry2 - ry1) // 2
+            roi = frame[max(0, cy - side // 2): min(H, cy + side // 2),
+                        max(0, cx - side // 2): min(W, cx + side // 2)]
+            scale = TARGET_SIZE / roi.shape[0]
+            resized = cv2.resize(roi, None, fx=scale, fy=scale)
 
+            results = model(resized, verbose=False, device=device)[0]
             dets = sv.Detections.from_ultralytics(results)
-            mask = (np.isin(dets.class_id, list(KEEP_IDS))
-                    & (dets.confidence > CONF_THRES)); dets = dets[mask]
+            mask = (np.isin(dets.class_id, list(KEEP_IDS)) & (dets.confidence > CONF_THRES))
+            dets = dets[mask]
             for i in range(len(dets)):
-                dets.xyxy[i] = scale_bbox(dets.xyxy[i], scale, ROI[0], ROI[1])
+                dets.xyxy[i] = [int(d / scale + (cx - side // 2 if n % 2 == 0 else cy - side // 2))
+                                for n, d in enumerate(dets.xyxy[i])]
             dets = dets[poly_zone.trigger(dets)]
 
-            det_sort = (np.hstack((dets.xyxy, dets.confidence.reshape(-1,1)))
-                        if len(dets) else np.empty((0,5)))
+            det_sort = np.hstack((dets.xyxy, dets.confidence.reshape(-1, 1))) if len(dets) else np.empty((0, 5))
             tracks = tracker.update(det_sort)
 
             for tr in tracks.astype(int):
-                x1,y1,x2,y2,tid=tr
-                match = best_match([x1,y1,x2,y2], dets.xyxy)
-                if match:
-                    d_idx,_ = match; cid=int(dets.class_id[d_idx])
-                    conf=float(dets.confidence[d_idx]); label=CLASS_NAMES[cid]
-                else: label,conf="Unknown",0.0
-                disp_id=id_map.setdefault(tid,len(id_map)+1)
-                cy2=y2
-                if abs(cy2-POINT_A_Y)<=LINE_TOL and tid not in entry_times:
-                    entry_times[tid]=datetime.now()
-                elif tid in entry_times and tid not in speeds and \
-                     abs(cy2-POINT_B_Y)<=LINE_TOL:
-                    dt=(datetime.now()-entry_times[tid]).total_seconds()
-                    if dt>0: speeds[tid]=round(DIST_METERS/dt*FACTOR_KM,2)
+                x1, y1, x2, y2, tid = tr
+                match = best_match([x1, y1, x2, y2], dets.xyxy)
+                cid, conf = (int(dets.class_id[match[0]]), float(dets.confidence[match[0]])) if match else (None, 0.0)
+                label = CLASS_NAMES[cid] if cid is not None else "Unknown"
+                disp_id = id_map.setdefault(tid, len(id_map) + 1)
 
-                col=(0,0,255) if speeds.get(tid,0)>SPEED_LIMIT else (255,255,0)
-                cv2.rectangle(frame,(x1,y1),(x2,y2),col,2)
-                cv2.putText(frame,f"{label} {conf:.2f}",(x1,y1-40),
-                            cv2.FONT_HERSHEY_SIMPLEX,0.7,(0,255,0),2)
-                txt=f"ID {disp_id}"
+                cy2 = y2
+                lineA_y, lineB_y = int(LINE_A_REL * H), int(LINE_B_REL * H)
+                if abs(cy2 - lineA_y) <= 3 and tid not in entry_times:
+                    entry_times[tid] = ts_video
+                elif tid in entry_times and tid not in speeds and abs(cy2 - lineB_y) <= 3:
+                    dt = ts_video - entry_times[tid]
+                    speeds[tid] = round(seconds_to_kmh(dt), 2)
+
+                col = (0, 0, 255) if speeds.get(tid, 0) > SPEED_LIMIT else (255, 255, 0)
+                cv2.rectangle(frame, (x1, y1), (x2, y2), col, 2)
+                cv2.putText(frame, f"{label} {conf:.2f}", (x1, y1 - 40), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+                txt = f"ID {disp_id}"
                 if tid in speeds:
-                    txt+=f" | {speeds[tid]} km/h"
-                    if speeds[tid]>SPEED_LIMIT:
-                        cv2.putText(frame,"OVERSPEEDING",(x1,y1-60),
-                                    cv2.FONT_HERSHEY_SIMPLEX,0.8,(0,0,255),2)
-                cv2.putText(frame,txt,(x1,y1-20),
-                            cv2.FONT_HERSHEY_SIMPLEX,0.7,(0,255,0),2)
+                    txt += f" | {speeds[tid]} km/h"
+                    if speeds[tid] > SPEED_LIMIT:
+                        cv2.putText(frame, "OVERSPEEDING", (x1, y1 - 60), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2)
+                cv2.putText(frame, txt, (x1, y1 - 20), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
 
-            cv2.polylines(frame,[poly_zone.polygon],True,(0,255,0),2)
-            cv2.line(frame,(0,POINT_A_Y),(W,POINT_A_Y),(0,255,0),2)
-            cv2.line(frame,(0,POINT_B_Y),(W,POINT_B_Y),(0,0,255),2)
+            # Draw ROI & speed lines
+            cv2.polylines(frame, [ROI_POLY], True, (0, 255, 0), 2)
+            cv2.line(frame, (0, int(LINE_A_REL * H)), (W, int(LINE_A_REL * H)), (0, 255, 0), 2)
+            cv2.line(frame, (0, int(LINE_B_REL * H)), (W, int(LINE_B_REL * H)), (0, 0, 255), 2)
 
-            writer.write(frame); processed += 1
-            prog.progress(idx/total_frames)
-        ok, frame = cap.read(); idx += 1
+            writer.write(frame)
+            processed += 1
+            update_progress(idx)
 
-    cap.release(); writer.release(); prog.empty()
+        ret, frame = cap.read()
+        idx += 1
 
-    st.success(f"Done – wrote {processed} frames @ {out_fps:.1f} FPS")
-    st.video(out_path)                              # FIX ③ plays correctly
-    st.download_button("Download processed MP4",
-                       data=open(out_path,"rb"),
-                       file_name="processed.mp4",
-                       mime="video/mp4")
+    cap.release()
+    writer.release()
 
-if st.session_state.get("tmpfiles"):
-    if st.button("Delete temporary files"):
-        cleanup_files(); st.success("Temporary files removed.")
+    prog.empty()
+    st.success(f"✅ Completed – wrote {processed} frames @ {out_fps:.1f} FPS")
+
+    col1, col2 = st.columns(2)
+    with col1:
+        st.subheader("Original video")
+        st.video(str(in_path))
+    with col2:
+        st.subheader("Processed video")
+        st.video(str(out_path))
+
+    st.download_button("📥 Download processed MP4", data=open(out_path, "rb"), file_name=out_path.name, mime="video/mp4")
+
+    with st.expander("🧹 Clean up temp files"):
+        if st.button("Delete temp files now"):
+            cleanup_temp()
+            st.success("Temporary files removed.")
