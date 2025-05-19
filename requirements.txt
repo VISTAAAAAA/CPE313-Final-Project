@@ -6,3 +6,5 @@ ultralytics
 supervision
 sort-tracker
 torchvision
+cmake
+ninja
