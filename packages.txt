@@ -1,6 +1,7 @@
 ffmpeg
 libsm6
 libxext6
-libgl1-mesa-glx
-libopencv-dev
-
+libxrender1
+libgl1
+libglib2.0-0
+libeigen3-dev
