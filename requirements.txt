@@ -4,7 +4,7 @@ numpy
 torch
 ultralytics
 supervision
-sort-tracker
 torchvision
 cmake
 ninja
+pillow
