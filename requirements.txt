@@ -9,3 +9,4 @@ cmake
 ninja
 pillow
 scikit-image
+filterpy
